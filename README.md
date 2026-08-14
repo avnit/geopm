@@ -216,3 +216,24 @@ Brad Geltz <brad.geltz@intel.com> <br>
 ## Acknowledgments
 Development of the GEOPM software package has been partially funded
 through contract B609815 with Argonne National Laboratory.
+
+<!-- ARCH-DIAGRAM:START -->
+
+## Architecture
+
+> Auto-generated architecture diagram. See [`docs/context-map.md`](docs/context-map.md) for the full context map (core application, containers/cloud, and database connections).
+
+```mermaid
+flowchart TD
+  User([User / Client])
+  App["geopm<br/><small>__main__.py</small><br/>Application"]
+  DB0[("SQLite")]
+  Img["Container image<br/>(Docker)"]
+  Deploy["GKE / Kubernetes"]
+  User --> App
+  App --> DB0
+  App -.deploy.-> Img
+  Img -.deploy.-> Deploy
+```
+
+<!-- ARCH-DIAGRAM:END -->
