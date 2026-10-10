@@ -7,9 +7,15 @@
 #define LEVELZEROIMP_HPP_INCLUDE
 
 #include <string>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <chrono>
+#include <exception>
 
 #include <level_zero/ze_api.h>
 #include <level_zero/zes_api.h>
+#include <level_zero/zet_api.h>
 
 #include "LevelZero.hpp"
 
@@ -21,7 +27,7 @@ namespace geopm
     {
         public:
             LevelZeroImp();
-            virtual ~LevelZeroImp() = default;
+            virtual ~LevelZeroImp();
             int num_gpu(void) const override;
             int num_gpu(int domain) const override;
             int frequency_domain_count(unsigned int l0_device_idx,
@@ -126,6 +132,14 @@ namespace geopm
             double ras_display_errcount_uncorrectable(unsigned int l0_device_idx,
                                                       int l0_domain,
                                                       int l0_domain_idx) const override;
+            std::vector<double> metric_sample(unsigned int l0_device_idx,
+                                              unsigned int l0_domain_idx,
+                                              std::string metric_name) const override;
+            uint32_t metric_update_rate(unsigned int l0_device_idx) const override;
+            void metric_update_rate_control(unsigned int l0_device_idx, uint32_t setting) override;
+
+            void metric_read(unsigned int l0_device_idx,
+                             unsigned int l0_domain_idx) override;
 
         private:
             enum m_error_type {
@@ -170,12 +184,53 @@ namespace geopm
                 // then by error set type (correctable vs uncorrectable)
                 std::vector<zes_ras_handle_t> ras_domain;
 
+                //ZE Context used for ZET data collection.  Chip indexed
+                std::vector<ze_context_handle_t> context;
+
+                // required for L0 metric querying.  Chip indexed
+                std::vector<uint32_t> num_metric;
+                std::vector<uint32_t> num_reports;
+                std::vector<bool> metric_domain_cached;
+                std::vector<zet_metric_streamer_handle_t> metric_streamer;
+                std::vector<zet_metric_group_handle_t> metric_group_handle; //ComputeBasic only
+                std::vector<size_t> zet_data_size;
+                std::vector<std::vector<uint8_t>> zet_data;
+                std::vector<size_t> report_byte_size;  // Learned per-report byte size (0 until first read)
+
+                // Cached metric name -> index within a report. Chip indexed.
+                // Populated once during metric_group_init, used in metric_calc
+                // to avoid repeated zetMetricGet/zetMetricGetProperties calls.
+                std::vector<std::map<std::string, size_t>> metric_name_idx;
+
+                // required for L0 metric result tracking.  Chip indexed
+                mutable std::vector<std::map<std::string, std::vector<double>>> metric_data;
+                // Online per-metric aggregate written by the background sampling
+                // thread: the running sum and report count between read_batch()
+                // calls.  Bounded regardless of the consumer's read cadence; the
+                // read_batch() serving thread reduces this to the mean in
+                // metric_data once per read_batch().  Chip indexed.
+                struct m_metric_aggregate {
+                    double sum = 0.0;
+                    uint64_t count = 0;
+                };
+                mutable std::vector<std::map<std::string, m_metric_aggregate>> metric_data_accum;
+                // Whether the background thread should drain this chip's
+                // streamer (set when the chip is first read via read_batch()).
+                // Chip indexed.
+                std::vector<bool> metric_active;
+                // Time the chip's streamer was last drained (by either the
+                // read_batch() serving thread or the background thread).  Used so
+                // the thread only drains as a keep-alive when read_batch() isn't
+                // draining frequently enough on its own.  Chip indexed.
+                std::vector<std::chrono::steady_clock::time_point> metric_last_drain;
+                mutable std::vector<bool> metrics_initialized;
             };
 
             struct m_device_info_s {
+                ze_driver_handle_t driver;
                 zes_device_handle_t device_handle;
                 ze_device_properties_t property;
-                uint32_t m_num_subdevice;
+                uint32_t num_subdevice;
                 std::vector<zes_device_handle_t> subdevice_handle;
 
                 // Sub-Device domain tracking.  Because levelzero returns ALL handles for a
@@ -185,12 +240,16 @@ namespace geopm
                 m_subdevice_s subdevice;
 
                 // Device/Package domains
-                uint32_t num_device_power_domain;
                 zes_pwr_handle_t power_domain;
+
+                uint32_t num_device_power_domain;
                 mutable uint64_t cached_energy_timestamp;
+
+                uint32_t metric_sampling_period_ns;
             };
 
             void ras_domain_cache(unsigned int l0_device_idx);
+
             void frequency_domain_cache(unsigned int l0_device_idx);
             void power_domain_cache(unsigned int l0_device_idx);
             void perf_domain_cache(unsigned int l0_device_idx);
@@ -217,6 +276,47 @@ namespace geopm
 
             std::vector<ze_driver_handle_t> m_levelzero_driver;
             std::vector<m_device_info_s> m_devices;
+
+            static constexpr uint32_t SAMPLING_PERIOD_NS = 500000; // 0.5 ms
+            static constexpr size_t DEFAULT_REPORT_BUFFER_SIZE = 16 * 1024 * 1024; // 16 MB
+            static constexpr uint32_t DEFAULT_MAX_REPORTS_PER_READ = 30;
+            // Fixed cadence at which the background thread drains the metric
+            // streamers, independent of the read_batch() cadence.  Frequent
+            // draining keeps the Intel metric streamer delivering continuously
+            // (a slow drain interval stalls it into multi-second NOT_READY bursts).
+            static constexpr uint64_t METRIC_DRAIN_PERIOD_US = 20000; // 20 ms
+
+            // Background metric sampling thread and the state it shares with the
+            // read_batch() serving thread -- the controller, or the geopmd batch
+            // server when LevelZero is accessed through the service
+            // (metric_data_accum, protected by m_metric_mutex).
+            std::thread m_metric_thread;
+            std::mutex m_metric_mutex;
+            std::atomic<bool> m_metric_thread_active;
+            bool m_metric_thread_started;
+            // Captures an exception thrown by metric_drain on the background
+            // thread so the read_batch() path can rethrow it, rather than the
+            // thread terminating the process.  Protected by m_metric_mutex.
+            std::exception_ptr m_metric_thread_error;
+
+            void metric_group_init(unsigned int l0_device_idx);
+            void metric_calc(unsigned int l0_device_idx, unsigned int l0_domain_idx,
+                             size_t data_size, const uint8_t *data);
+
+            void metric_execute(unsigned int l0_device_idx,
+                                unsigned int l0_domain_idx);
+            void metric_destroy(unsigned int l0_device_idx,
+                                unsigned int l0_domain_idx);
+
+            // Background sampling thread: drains active streamers every
+            // METRIC_DRAIN_PERIOD_US and accumulates reports.
+            void metric_sample_thread(void);
+            // Read one chip's streamer and append the reports to the accumulator.
+            void metric_drain(unsigned int l0_device_idx, unsigned int l0_domain_idx);
+            void metric_thread_start(void);
+            void metric_thread_stop(void);
+
+            double metric_data_convert(zet_typed_value_t data) const;
     };
 }
 #endif

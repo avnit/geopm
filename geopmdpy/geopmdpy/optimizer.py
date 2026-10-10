@@ -197,8 +197,8 @@ def build_objective(metric_specs, maximize, minimize,
         penalty_weight: Weight for the constraint-violation penalty.
 
     Returns:
-        ObjectiveSpec: The canonical objective, with :attr:`metric_map`
-        populated by the parsed metrics.
+        ObjectiveSpec: The canonical objective, with
+        :attr:`ObjectiveSpec.metric_map` populated by the parsed metrics.
 
     Raises:
         ValueError: If no objective, more than one objective, a duplicate
@@ -1523,7 +1523,9 @@ def get_parser():
     parser.add_argument(
         '--output-file',
         default='-',
-        help='Output the best configuration to a geompwrite configuration file (default: stdout)'
+        help='Output the best configuration to a geopmwrite configuration file '
+             '(default: stdout). For a cpu-freq sweep this file also sets the '
+             'performance governor so the saved frequency takes effect.'
     )
 
     parser.add_argument(

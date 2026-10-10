@@ -54,9 +54,8 @@ namespace geopm
             const PlatformTopo &m_platform_topo;
             static constexpr double M_WAIT_SEC = 0.020; // 20ms wait default
             const double M_POLICY_PHI_DEFAULT;
+            const double M_GPU_ACTIVITY_CUTOFF;
             const int M_NUM_GPU;
-            const int M_NUM_GPU_CHIP;
-            const int M_NUM_CHIP_PER_GPU;
             bool m_do_write_batch;
             bool m_do_send_policy;
             bool m_has_freq_min_control;
@@ -97,11 +96,25 @@ namespace geopm
             double m_resolved_f_gpu_max;
             double m_resolved_f_gpu_efficient;
             double m_f_range;
+            // Whether each GPU is currently inside an active region (ROI proxy).
+            std::vector<bool> m_gpu_region_active;
+            std::vector<double> m_gpu_active_region_start;
+            std::vector<double> m_gpu_active_region_stop;
+            std::vector<double> m_gpu_active_energy_start;
+            std::vector<double> m_gpu_active_energy_stop;
+            std::vector<double> m_gpu_on_time;
+            std::vector<double> m_gpu_on_energy;
+            std::vector<int> m_gpu_idle_samples;
 
             std::vector<m_signal> m_gpu_core_activity;
+            std::vector<m_signal> m_gpu_stall_activity;
             std::vector<m_signal> m_gpu_utilization;
             std::vector<m_signal> m_gpu_energy;
+            std::vector<int> m_gpu_idle_timer;
+
             m_signal m_time;
+            double m_prev_time;
+            std::vector<double> m_prev_gpu_energy;
 
             std::vector<m_control> m_gpu_freq_min_control;
             std::vector<m_control> m_gpu_freq_max_control;

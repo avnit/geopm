@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <string>
 #include <cstdint>
+#include <numeric>
 
 #include "geopm/Exception.hpp"
 #include "geopm/Agg.hpp"
@@ -17,13 +18,13 @@
 
 namespace geopm
 {
-    const LevelZeroDevicePool &levelzero_device_pool()
+    LevelZeroDevicePool &levelzero_device_pool()
     {
         static LevelZeroDevicePoolImp instance(levelzero());
         return instance;
     }
 
-    LevelZeroDevicePoolImp::LevelZeroDevicePoolImp(const LevelZero &levelzero)
+    LevelZeroDevicePoolImp::LevelZeroDevicePoolImp(LevelZero &levelzero)
         : m_levelzero(levelzero)
     {
     }
@@ -793,4 +794,57 @@ namespace geopm
     }
 
 
+    //TODO: consider adding 'group_name' parameter?
+    void LevelZeroDevicePoolImp::metric_read(int domain, unsigned int domain_idx) const
+    {
+        if (domain != GEOPM_DOMAIN_GPU_CHIP) {
+            throw Exception("LevelZeroDevicePool::" + std::string(__func__) +
+                            ": domain " + std::to_string(domain) +
+                            " is not supported for metrics.",
+                            GEOPM_ERROR_INVALID, __FILE__, __LINE__);
+        }
+
+        std::pair<unsigned int, unsigned int> dev_subdev_idx_pair;
+        dev_subdev_idx_pair = subdevice_device_conversion(domain_idx);
+
+        m_levelzero.metric_read(dev_subdev_idx_pair.first, dev_subdev_idx_pair.second);
+    }
+
+    double LevelZeroDevicePoolImp::metric_sample(int domain, unsigned int domain_idx,
+                                                 std::string metric_name) const
+    {
+        double result = NAN;
+        if (domain != GEOPM_DOMAIN_GPU_CHIP) {
+            throw Exception("LevelZeroDevicePool::" + std::string(__func__) +
+                            ": domain " + std::to_string(domain) +
+                            " is not supported for metrics.",
+                            GEOPM_ERROR_INVALID, __FILE__, __LINE__);
+        }
+
+        std::pair<unsigned int, unsigned int> dev_subdev_idx_pair;
+        dev_subdev_idx_pair = subdevice_device_conversion(domain_idx);
+
+        std::vector<double> data = m_levelzero.metric_sample(dev_subdev_idx_pair.first,
+                                                             dev_subdev_idx_pair.second,
+                                                             metric_name);
+
+        if (data.size() > 0) {
+            //TODO: add min, max, avg etc handling.
+            result = std::accumulate(data.begin(), data.end(), 0.0) / data.size();
+        }
+        return result;
+    }
+
+    uint32_t LevelZeroDevicePoolImp::metric_update_rate(int domain, unsigned int domain_idx) const
+    {
+        if (domain != GEOPM_DOMAIN_GPU) {
+            throw Exception("LevelZeroDevicePool::" + std::string(__func__) +
+                            ": domain " + std::to_string(domain) +
+                            " is not supported for metrics.",
+                            GEOPM_ERROR_INVALID, __FILE__, __LINE__);
+        }
+
+        check_idx_range(GEOPM_DOMAIN_GPU, domain_idx);
+        return m_levelzero.metric_update_rate(domain_idx);
+    }
 }

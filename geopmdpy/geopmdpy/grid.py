@@ -27,11 +27,16 @@ _PREFETCHER_CONTROL_SEQUENCE = (
 # _MAX_PREFETCH_DISABLE_LEVEL represents the number of available prefetchers.
 #  Selecting the max value disables all prefetchers.
 _MAX_PREFETCH_DISABLE_LEVEL = len(_PREFETCHER_CONTROL_SEQUENCE)
+# CPU_FREQUENCY_MAX_CONTROL only caps the frequency; other governors (e.g.
+# powersave, schedutil) may still scale below the cap, so cpu_frequency
+# sweeps force the "performance" governor to make the requested value stick.
+_GOVERNOR_CONTROL = "CPU_FREQUENCY_GOVERNOR_CONTROL"
+_GOVERNOR_PERFORMANCE = 0
 _CLI_FLAG_TO_CONTROL = {
     "cpu_frequency": (
         "CPU_FREQUENCY_MAX_CONTROL",
         "CPU_FREQUENCY_MIN_AVAIL",
-        "CPU_FREQUENCY_MAX_AVAIL",
+        "CPU_FREQUENCY_STICKER", # Sticker (base) frequency, not the turbo max, is the default upper bound.
         "CPU_FREQUENCY_STEP",
     ),
     "cpu_uncore_frequency": (
@@ -320,7 +325,10 @@ def add_grid_cli_arguments(parser: ArgumentParser) -> None:
         help="Add a control dimension to sweep (repeatable). "
              "DIM = CONTROL[@DOMAIN][=MIN:MAX:STEP]. Domain defaults to the "
              "control's native domain and bounds default to auto-detected "
-             "values. See --list-controls for names, domains, and units.",
+             "values. For cpu-freq the default maximum is the sticker (base) "
+             "frequency, not the turbo max, and a performance-governor control "
+             "is added to the generated configuration. See --list-controls for "
+             "names, domains, and units.",
     )
     parser.add_argument(
         "--list-controls",
@@ -678,6 +686,12 @@ class ControlGrid:
         If coordinate is None, it uses the instance's coordinate.
         If the coordinate is not provided or does not match the grid dimensions,
         it raises a ValueError.
+
+        When the grid includes a ``cpu_frequency`` dimension, a
+        ``CPU_FREQUENCY_GOVERNOR_CONTROL board 0 0`` tuple is prepended to the
+        result so that the requested frequency is honored under the
+        ``performance`` governor rather than treated only as a cap under another
+        governor.
         Args:
             coordinate (list[int], optional): List of indices for each control dimension.
         Returns:
@@ -703,6 +717,8 @@ class ControlGrid:
             min_control = dim["control"].replace("_MAX_", "_MIN_")
             if min_control != dim["control"] and min_control in pio.control_names() and min_control != "CPU_FREQUENCY_MIN_CONTROL":
                 result.append((min_control, dim["domain"], dim["domain_idx"], value))
+        if "cpu_frequency" in self.control_name:
+            result.insert(0, (_GOVERNOR_CONTROL, "board", 0, _GOVERNOR_PERFORMANCE))
         return result
 
     def get_config_str(self, coordinate: Optional[List[int]] = None):

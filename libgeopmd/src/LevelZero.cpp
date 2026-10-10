@@ -4,16 +4,19 @@
  */
 
 
-#include <unistd.h>
 #include <string>
 #include <iostream>
 #include <map>
 #include <cstdlib>
 #include <utility>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <chrono>
 
 #include "geopm/Exception.hpp"
-#include "geopm/Agg.hpp"
 #include "geopm/Helper.hpp"
+#include "geopm_debug.hpp"
 
 #include "LevelZeroImp.hpp"
 
@@ -26,7 +29,8 @@ namespace geopm
         }
         return result;
     }
-    const LevelZero &levelzero()
+
+    LevelZero &levelzero()
     {
         static LevelZeroImp instance;
         return instance;
@@ -35,6 +39,8 @@ namespace geopm
     LevelZeroImp::LevelZeroImp()
         : m_num_gpu(0)
         , m_num_gpu_subdevice(0)
+        , m_metric_thread_active(false)
+        , m_metric_thread_started(false)
     {
         if (getenv("ZE_AFFINITY_MASK") != nullptr) {
             throw Exception("LevelZero: Cannot be used directly when ZE_AFFINITY_MASK environment "
@@ -129,8 +135,13 @@ namespace geopm
                             m_num_gpu_subdevice += 1;
                         }
 
-                        //NOTE: We're only supporting Board GPUs to start with
+                        // A ZET context is created per subdevice in
+                        // metric_group_init, so no device-level context is needed here.
+                        // TODO: Explore replacing per-subdevice contexts with a single
+                        // context (per-device or globally).
+
                         m_devices.push_back({
+                            m_levelzero_driver.at(driver),
                             device_handle.at(device_idx),
                             property,
                             num_subdevice, //if there are no subdevices leave this as 0
@@ -139,6 +150,7 @@ namespace geopm
                             0, //num_device_power_domain
                             {}, //power domain
                             0, // cached_energy_timestamp
+                            0, // metric_sampling_period_ns
                         });
                     }
 #ifdef GEOPM_DEBUG
@@ -180,7 +192,7 @@ namespace geopm
             // If we have more than one device confirm all devices have the same
             // number of subdevices
             for (unsigned int idx = 1; idx < m_devices.size(); ++idx) {
-                if (m_devices.at(idx).m_num_subdevice != m_devices.at(idx - 1).m_num_subdevice) {
+                if (m_devices.at(idx).num_subdevice != m_devices.at(idx - 1).num_subdevice) {
                     throw Exception("LevelZero::" + std::string(__func__) +
                                     ": GEOPM Requires the number of subdevices to be" +
                                     " the same on all devices. " +
@@ -199,6 +211,59 @@ namespace geopm
             engine_domain_cache(gpu_idx);
             temperature_domain_cache(gpu_idx);
             ras_domain_cache(gpu_idx);
+            // Metrics are optional: ZET may be unsupported by the hardware or
+            // driver.  Do not let an enumeration failure abort the whole Level
+            // Zero backend.  Pad the per-chip tracking vectors the drain thread
+            // and metric guards index so uninitialized domains are left uncached
+            // and pruned like any other unsupported signal.
+            try {
+                metric_group_init(gpu_idx);
+            }
+            catch (const Exception &ex) {
+                auto &sub = m_devices.at(gpu_idx).subdevice;
+                unsigned int num_subdevice = m_devices.at(gpu_idx).num_subdevice;
+                sub.metric_domain_cached.resize(num_subdevice, false);
+                sub.metrics_initialized.resize(num_subdevice, false);
+                sub.metric_active.resize(num_subdevice, false);
+                sub.metric_last_drain.resize(num_subdevice,
+                                             std::chrono::steady_clock::time_point{});
+                std::cerr << "Warning: <geopm> LevelZero metrics unavailable for GPU "
+                          << gpu_idx << ": " << ex.what() << std::endl;
+            }
+        }
+    }
+
+    LevelZeroImp::~LevelZeroImp() {
+        // The destructor is implicitly noexcept, so a cleanup failure that
+        // escaped would call std::terminate() during shutdown.  Contain errors
+        // and continue tearing down every chip.
+        try {
+            // Stop the background sampling thread before tearing down streamers.
+            metric_thread_stop();
+        }
+        catch (const std::exception &ex) {
+#ifdef GEOPM_DEBUG
+            std::cerr << "Warning: <geopm> LevelZero::~LevelZeroImp(): "
+                      << "failed to stop the metric thread: " << ex.what()
+                      << std::endl;
+#endif
+        }
+        for (unsigned int gpu_idx = 0; gpu_idx < m_num_gpu; ++gpu_idx) {
+            for (unsigned int subdevice_idx = 0;
+             subdevice_idx < m_devices.at(gpu_idx).num_subdevice;
+             ++subdevice_idx) {
+                try {
+                    metric_destroy(gpu_idx, subdevice_idx);
+                }
+                catch (const std::exception &ex) {
+#ifdef GEOPM_DEBUG
+                    std::cerr << "Warning: <geopm> LevelZero::~LevelZeroImp(): "
+                              << "metric cleanup failed for GPU " << gpu_idx
+                              << " chip " << subdevice_idx << ": " << ex.what()
+                              << std::endl;
+#endif
+                }
+            }
         }
     }
 
@@ -233,7 +298,7 @@ namespace geopm
                                 GEOPM_ERROR_RUNTIME, "LevelZero::" + std::string(__func__) +
                                 ": Sysman failed to get domain properties.", __LINE__);
 
-                if (property.onSubdevice == 0 && m_devices.at(device_idx).m_num_subdevice != 0) {
+                if (property.onSubdevice == 0 && m_devices.at(device_idx).num_subdevice != 0) {
 #ifdef GEOPM_DEBUG
                     std::cerr << "Warning: <geopm> LevelZero: A device level "
                               << "frequency domain was found but is not currently supported.\n";
@@ -309,12 +374,12 @@ namespace geopm
                                 GEOPM_ERROR_INVALID, __FILE__, __LINE__);
             }
 
-            if (num_subdevice_power_domain > m_devices.at(device_idx).m_num_subdevice) {
+            if (num_subdevice_power_domain > m_devices.at(device_idx).num_subdevice) {
                 throw Exception("LevelZero::" + std::string(__func__) +
                                 ": Number of subdevice power domains (" +
                                 std::to_string(num_device_power_domain) +
                                 ") exceeds the number of subdevices (" +
-                                std::to_string(m_devices.at(device_idx).m_num_subdevice) + ").",
+                                std::to_string(m_devices.at(device_idx).num_subdevice) + ").",
                                 GEOPM_ERROR_INVALID, __FILE__, __LINE__);
             }
 
@@ -408,7 +473,7 @@ namespace geopm
                                 GEOPM_ERROR_RUNTIME, "LevelZero::" + std::string(__func__) +
                                 ": Sysman failed to get domain engine properties", __LINE__);
 
-                if (property.onSubdevice == 0 && m_devices.at(device_idx).m_num_subdevice != 0) {
+                if (property.onSubdevice == 0 && m_devices.at(device_idx).num_subdevice != 0) {
 #ifdef GEOPM_DEBUG
                     std::cerr << "Warning: <geopm> LevelZero: A device level "
                               << "engine domain was found but is not currently supported.\n";
@@ -513,10 +578,565 @@ namespace geopm
         }
     }
 
+    //  Cache the following per gpu_idx:
+    //      - caching & initialization tracking variable
+    //      - L0 context
+    //      - metric group handle
+    //      - sampling period
+    //      - data storage for the ComputeBasics metric group
+    void LevelZeroImp::metric_group_init(unsigned int device_idx) {
+        for (unsigned int subdevice_idx = 0;
+             subdevice_idx < m_devices.at(device_idx).num_subdevice;
+             ++subdevice_idx) {
+            // Setup tracking of the caching and initialization steps
+            m_devices.at(device_idx).subdevice.metric_domain_cached.push_back(false);
+            m_devices.at(device_idx).subdevice.metrics_initialized.push_back(false);
+
+            ze_result_t ze_result;
+
+            // We create a context to support the ZET commands
+            ze_context_desc_t context_desc = {
+               ZE_STRUCTURE_TYPE_CONTEXT_DESC,
+               nullptr,
+               0
+            };
+            ze_context_handle_t context = nullptr;
+            ze_result = zeContextCreate(m_devices.at(device_idx).driver,
+                                        &context_desc, &context);
+            check_ze_result(ze_result, GEOPM_ERROR_RUNTIME,
+                            "LevelZero::" + std::string(__func__) +
+                            ": LevelZero context creation failed",
+                            __LINE__);
+
+            m_devices.at(device_idx).subdevice.context.push_back(context);
+
+            //Metric groups
+            uint32_t num_metric_group = 0;
+            ze_result = zetMetricGroupGet(m_devices.at(device_idx).subdevice_handle.at(subdevice_idx),
+                                          &num_metric_group, nullptr);
+
+            check_ze_result(ze_result, GEOPM_ERROR_RUNTIME,
+                            "LevelZero::" + std::string(__func__) +
+                            ": LevelZero Metric Group enumeration failed.",
+                             __LINE__);
+
+            std::vector<zet_metric_group_handle_t> metric_group_handle(num_metric_group);
+            ze_result = zetMetricGroupGet(m_devices.at(device_idx).subdevice_handle.at(subdevice_idx),
+                                          &num_metric_group, metric_group_handle.data());
+
+            check_ze_result(ze_result, GEOPM_ERROR_RUNTIME,
+                            "LevelZero::" + std::string(__func__) +
+                            ": LevelZero Metric Group handle acquisition failed",
+                            __LINE__);
+
+            // set metric_notifcation_event sampling period in nanoseconds
+            m_devices.at(device_idx).metric_sampling_period_ns = SAMPLING_PERIOD_NS;
+
+            m_devices.at(device_idx).subdevice.metric_data.push_back({});
+            m_devices.at(device_idx).subdevice.metric_data_accum.push_back({});
+            m_devices.at(device_idx).subdevice.metric_active.push_back(false);
+            m_devices.at(device_idx).subdevice.metric_last_drain.push_back(
+                std::chrono::steady_clock::time_point{});
+            // Pre-size the streamer and read-buffer vectors so metric_execute can
+            // assign by chip index; push_signal permits chips to be read in any
+            // order, not just chip 0 first.
+            m_devices.at(device_idx).subdevice.metric_streamer.push_back(nullptr);
+            m_devices.at(device_idx).subdevice.zet_data_size.push_back(0);
+            m_devices.at(device_idx).subdevice.zet_data.push_back({});
+            m_devices.at(device_idx).subdevice.report_byte_size.push_back(0);
+
+            bool found_group = false;
+            for (unsigned int metric_group_idx = 0; metric_group_idx < num_metric_group;
+                 metric_group_idx++) {
+                zet_metric_group_properties_t metric_group_properties = {};
+                metric_group_properties.stype = ZET_STRUCTURE_TYPE_METRIC_GROUP_PROPERTIES;
+                ze_result = zetMetricGroupGetProperties(metric_group_handle.at(metric_group_idx),
+                                            &metric_group_properties);
+                check_ze_result(ze_result,GEOPM_ERROR_RUNTIME,
+                                "LevelZero::" + std::string(__func__) +
+                                ": LevelZero Metric Group property acquisition failed",
+                                __LINE__);
+
+                std::string metric_group_name (metric_group_properties.name);
+
+                // Confirm metric groups of interest exist
+                // Eventually the metric group of interest may be configurable,
+                // to start we're using compute basics
+                if (metric_group_properties.samplingType == ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_TIME_BASED
+                    && metric_group_name == "ComputeBasic") {
+
+                   //cache compute basic metric group
+                   m_devices.at(device_idx).subdevice.metric_group_handle.push_back(metric_group_handle.at(metric_group_idx));
+
+                   // could likely use metric_group_properties.metricCount instead
+                   uint32_t num_metric = 0;
+                   ze_result = zetMetricGet(metric_group_handle.at(metric_group_idx), &num_metric, nullptr );
+                   check_ze_result(ze_result, GEOPM_ERROR_RUNTIME,
+                                   "LevelZero::" + std::string(__func__) +
+                                   ": LevelZero Metric Count query failed",
+                                   __LINE__);
+
+                   //Cache compute basic number of metrics
+                   m_devices.at(device_idx).subdevice.num_metric.push_back(num_metric);
+
+                   std::vector<zet_metric_handle_t> metric_handle(num_metric);
+                   ze_result = zetMetricGet(metric_group_handle.at(metric_group_idx),
+                                            &num_metric, metric_handle.data());
+
+                   check_ze_result(ze_result, GEOPM_ERROR_RUNTIME,
+                                   "LevelZero::" + std::string(__func__) +
+                                   ": LevelZero Metric handle acquisition failed",
+                                   __LINE__);
+
+                   //Build metric map and name-to-index cache
+                   std::map<std::string, size_t> name_idx;
+                   for (unsigned int metric_idx = 0; metric_idx < num_metric; ++metric_idx)
+                   {
+                       zet_metric_properties_t metric_properties = {};
+                       metric_properties.stype = ZET_STRUCTURE_TYPE_METRIC_PROPERTIES;
+                       ze_result = zetMetricGetProperties(metric_handle.at(metric_idx), &metric_properties);
+
+                       check_ze_result(ze_result, GEOPM_ERROR_RUNTIME,
+                                       "LevelZero::" + std::string(__func__) +
+                                       ": LevelZero Metric Property acquisition failed",
+                                       __LINE__);
+
+                       std::string metric_name (metric_properties.name);
+
+                       //m_devices is a std::vector of structs, indexed by GPU
+                       // subdevice is a struct inside of it.  One per GPU
+                       //  metric_data is a vector, indexed by CHIP
+                       //    it contains a map of metric name (string) -> report data for N reports (vector<double>)
+                       if (m_devices.at(device_idx).subdevice.metric_data.at(subdevice_idx).count(metric_name) != 0) {
+                           throw Exception("LevelZero::" + std::string(__func__) +
+                                           ": Metric group has two metrics with the same name",
+                                           GEOPM_ERROR_INVALID, __FILE__, __LINE__);
+                       }
+                       m_devices.at(device_idx).subdevice.metric_data.at(subdevice_idx)[metric_name] = {};
+                       m_devices.at(device_idx).subdevice.metric_data.at(subdevice_idx)["NUM_REPORTS"] = {};
+
+                       // Cache index for metrics we process in metric_calc
+                       if (metric_name == "XVE_ACTIVE" ||
+                           metric_name == "XVE_STALL") {
+                           name_idx[metric_name] = metric_idx;
+                       }
+                   }
+                   m_devices.at(device_idx).subdevice.metric_name_idx.push_back(std::move(name_idx));
+                   found_group = true;
+                   // Break out of the metric group for loop once we've found the group of interest (ComputeBasic, time based sampling).
+                   break;
+                }
+            }
+            if (!found_group) {
+                // No time-based ComputeBasic group on this chip.  Push placeholder
+                // entries so the chip-indexed vectors stay aligned with the other
+                // per-chip state, and leave the domain uncached so its signals are
+                // pruned rather than indexing entries that were never populated.
+                m_devices.at(device_idx).subdevice.metric_group_handle.push_back(nullptr);
+                m_devices.at(device_idx).subdevice.num_metric.push_back(0);
+                m_devices.at(device_idx).subdevice.metric_name_idx.push_back({});
+            }
+            m_devices.at(device_idx).subdevice.metric_domain_cached.at(subdevice_idx) = found_group;
+        }
+    }
+
+    void LevelZeroImp::metric_destroy(unsigned int l0_device_idx, unsigned int l0_domain_idx)
+    {
+        auto &sub = m_devices.at(l0_device_idx).subdevice;
+
+        // The streamer and metric-group activation exist only once sampling was
+        // started for this chip.
+        if (l0_domain_idx < sub.metrics_initialized.size() &&
+            sub.metrics_initialized.at(l0_domain_idx)) {
+            sub.metrics_initialized.at(l0_domain_idx) = false;
+
+            // Close metric streamer
+            ze_result_t ze_result =
+                zetMetricStreamerClose(sub.metric_streamer.at(l0_domain_idx));
+            check_ze_result(ze_result, GEOPM_ERROR_RUNTIME,
+                            "LevelZero::" + std::string(__func__) +
+                            ": LevelZero Metric Streamer Close failed",
+                            __LINE__);
+
+            // Deactivate the metric group on the same subdevice used to activate it.
+            ze_result = zetContextActivateMetricGroups(sub.context.at(l0_domain_idx),
+                                                       m_devices.at(l0_device_idx).subdevice_handle.at(l0_domain_idx),
+                                                       0, nullptr);
+            check_ze_result(ze_result, GEOPM_ERROR_RUNTIME,
+                            "LevelZero::" + std::string(__func__) +
+                            ": LevelZero Metric Context Deactivation failed",
+                            __LINE__);
+        }
+
+        // metric_group_init creates the context before searching for the
+        // ComputeBasic group, so a context can exist even when the domain is
+        // left uncached.  Destroy it whenever one was created for this chip.
+        if (l0_domain_idx < sub.context.size() &&
+            sub.context.at(l0_domain_idx) != nullptr) {
+            zeContextDestroy(sub.context.at(l0_domain_idx));
+            sub.context.at(l0_domain_idx) = nullptr;
+        }
+    }
+
+
+    void LevelZeroImp::metric_execute(unsigned int l0_device_idx, unsigned int l0_domain_idx)
+    {
+        ze_result_t ze_result;
+        ze_context_handle_t context = m_devices.at(l0_device_idx).subdevice.context.at(l0_domain_idx);
+        ze_result = zetContextActivateMetricGroups(context, m_devices.at(l0_device_idx).subdevice_handle.at(l0_domain_idx),
+                                                   1, &m_devices.at(l0_device_idx).subdevice.metric_group_handle.at(l0_domain_idx));
+
+        check_ze_result(ze_result, GEOPM_ERROR_RUNTIME,
+                        "LevelZero::" + std::string(__func__) +
+                        ": LevelZero Metric Group Activation failed",
+                        __LINE__);
+
+        zet_metric_streamer_desc_t metric_streamer_desc = {
+            ZET_STRUCTURE_TYPE_METRIC_STREAMER_DESC,
+            nullptr,
+            0, // notifyEveryNReports: unused (no event handle registered)
+            m_devices.at(l0_device_idx).metric_sampling_period_ns};
+        zet_metric_streamer_handle_t metric_streamer = nullptr;
+
+        ze_result = zetMetricStreamerOpen(context, m_devices.at(l0_device_idx).subdevice_handle.at(l0_domain_idx), m_devices.at(l0_device_idx).subdevice.metric_group_handle.at(l0_domain_idx), &metric_streamer_desc, nullptr, &metric_streamer);
+
+        check_ze_result(ze_result, GEOPM_ERROR_RUNTIME,
+                        "LevelZero::" + std::string(__func__) +
+                        ": LevelZero Metric Streamer Open failed",
+                        __LINE__);
+
+        // Assign by chip index (pre-sized in metric_group_init); push_signal
+        // permits chips to be read in any order, not just chip 0 first.
+        m_devices.at(l0_device_idx).subdevice.metric_streamer.at(l0_domain_idx) = metric_streamer;
+
+        // Allocate memory for future reads
+        // Doing a read might not be the best way to set a buffer size, as the amount of data
+        // available at this point in time will likely not match the amount of data at any future
+        // point in time while sampling. Using a default buffer size for now...
+        size_t data_size = DEFAULT_REPORT_BUFFER_SIZE;
+
+        std::vector<uint8_t> data(data_size);
+        m_devices.at(l0_device_idx).subdevice.zet_data_size.at(l0_domain_idx) = data_size;
+        m_devices.at(l0_device_idx).subdevice.zet_data.at(l0_domain_idx) = std::move(data);
+        m_devices.at(l0_device_idx).subdevice.report_byte_size.at(l0_domain_idx) = 0;
+    }
+
+    void LevelZeroImp::metric_calc(unsigned int l0_device_idx, unsigned int l0_domain_idx,
+                                   size_t data_size, const uint8_t *data)
+    {
+        GEOPM_DEBUG_ASSERT(m_devices.at(l0_device_idx).subdevice.metric_domain_cached.at(l0_domain_idx) == true,
+                           "metric caching for GPU " + std::to_string(l0_device_idx) +
+                           ", CHIP " + std::to_string(l0_domain_idx) +
+                           " not completed prior to metric_calc call.");
+
+        GEOPM_DEBUG_ASSERT(m_devices.at(l0_device_idx).subdevice.metrics_initialized.at(l0_domain_idx) == true,
+                           "metric initialization for GPU " + std::to_string(l0_device_idx) +
+                           ", CHIP " + std::to_string(l0_domain_idx) +
+                           " not completed prior to metric_calc call.");
+
+        ze_result_t ze_result;
+        // Calculate and convert the metric data
+        uint32_t num_metric_values = 0;
+        zet_metric_group_calculation_type_t calculation_type = ZET_METRIC_GROUP_CALCULATION_TYPE_METRIC_VALUES;
+        ze_result = zetMetricGroupCalculateMetricValues(m_devices.at(l0_device_idx).subdevice.metric_group_handle.at(l0_domain_idx), calculation_type, data_size, data, &num_metric_values, nullptr);
+        check_ze_result(ze_result, GEOPM_ERROR_RUNTIME,
+                        "LevelZero::" + std::string(__func__) +
+                        ": LevelZero Metric group calculate metric values to find num metrics failed",
+                        __LINE__);
+
+        std::vector<zet_typed_value_t> metric_values(num_metric_values);
+        ze_result = zetMetricGroupCalculateMetricValues(m_devices.at(l0_device_idx).subdevice.metric_group_handle.at(l0_domain_idx), calculation_type, data_size, data, &num_metric_values, metric_values.data());
+        check_ze_result(ze_result, GEOPM_ERROR_RUNTIME,
+                        "LevelZero::" + std::string(__func__) +
+                        ": LevelZero Metric group calculate metric values to calculate data failed",
+                        __LINE__);
+
+        uint32_t num_metric = m_devices.at(l0_device_idx).subdevice.num_metric.at(l0_domain_idx);
+        unsigned int num_reports = num_metric_values / num_metric;
+
+        // If num_metric_values is not evenly divisible by num_metrics
+        // skip the metric and report processing for this sample
+        if (num_metric_values % num_metric != 0) {
+#ifdef GEOPM_DEBUG
+            std::cerr << "LevelZero::" << std::string(__func__)  <<
+                         ": ZET metric_calc call returned a number of metric values "
+                         "that is not evenly divisible by the number of metrics.  This "
+                         "may indicate a ZET report error, skipping data processing." << std::endl;
+#endif
+            return;
+        }
+
+        // Use the cached name→index map to avoid calling zetMetricGet and
+        // zetMetricGetProperties on every sample iteration.  Only the mean and
+        // report count are exposed, so accumulate a running sum and count online
+        // rather than retaining every report; the caller (metric_drain) holds
+        // m_metric_mutex, and the read_batch() serving thread reduces this to the
+        // mean in metric_data once per read_batch().
+        const auto &name_idx = m_devices.at(l0_device_idx).subdevice.metric_name_idx.at(l0_domain_idx);
+        auto &accum = m_devices.at(l0_device_idx).subdevice.metric_data_accum.at(l0_domain_idx);
+        for (const auto &kv : name_idx) {
+            const std::string &metric_name = kv.first;
+            size_t metric_idx = kv.second;
+
+            auto &aggregate = accum[metric_name];
+            for (unsigned int report_idx = 0; report_idx < num_reports; report_idx++) {
+                zet_typed_value_t data = metric_values.at(report_idx * num_metric + metric_idx);
+                aggregate.sum += metric_data_convert(data);
+            }
+            aggregate.count += num_reports;
+        }
+    }
+
+    double LevelZeroImp::metric_data_convert(zet_typed_value_t data) const
+    {
+        double data_double = NAN;
+        switch(data.type) {
+        case ZET_VALUE_TYPE_UINT32:
+            data_double = data.value.ui32;
+            break;
+        case ZET_VALUE_TYPE_UINT64:
+            data_double = data.value.ui64;
+            break;
+        case ZET_VALUE_TYPE_FLOAT32:
+            data_double = data.value.fp32;
+            break;
+        case ZET_VALUE_TYPE_FLOAT64:
+            data_double = data.value.fp64;
+            break;
+        case ZET_VALUE_TYPE_BOOL8:
+            data_double = data.value.b8;
+            break;
+        default:
+            break;
+        };
+        return data_double;
+    }
+
+    void LevelZeroImp::metric_read(unsigned int l0_device_idx, unsigned int l0_domain_idx)
+    {
+        // A GPU that exposes no subdevices is still counted as one GPU_CHIP by
+        // topology, but metric_group_init sets up no per-subdevice metric state
+        // for it, so this vector is empty.  Disable metrics for that domain
+        // rather than support them here.  Revisit if such a GPU is ever expected
+        // to provide valid metrics (see metric_group_init).
+        if (l0_domain_idx >= m_devices.at(l0_device_idx).subdevice.metric_domain_cached.size() ||
+            !m_devices.at(l0_device_idx).subdevice.metric_domain_cached.at(l0_domain_idx)) {
+            return;
+        }
+
+        const auto &name_idx = m_devices.at(l0_device_idx).subdevice.metric_name_idx.at(l0_domain_idx);
+        {
+            std::lock_guard<std::mutex> lock(m_metric_mutex);
+
+            // Surface any failure the background thread hit while draining.
+            if (m_metric_thread_error) {
+                std::exception_ptr err = m_metric_thread_error;
+                m_metric_thread_error = nullptr;
+                std::rethrow_exception(err);
+            }
+
+            // Open the streamer on first use, serialized with the background
+            // thread by m_metric_mutex.  metric_execute assigns the streamer by
+            // chip index, so this is safe regardless of the order chips are read.
+            if (!m_devices.at(l0_device_idx).subdevice.metrics_initialized.at(l0_domain_idx)) {
+                metric_execute(l0_device_idx, l0_domain_idx);
+                m_devices.at(l0_device_idx).subdevice.metrics_initialized.at(l0_domain_idx) = true;
+            }
+            m_devices.at(l0_device_idx).subdevice.metric_active.at(l0_domain_idx) = true;
+
+            // Drain now so this sample always has fresh data, regardless of how
+            // the read_batch() cadence compares to the background drain cadence.
+            metric_drain(l0_device_idx, l0_domain_idx);
+
+            // Reduce the accumulated reports (this drain plus any the background
+            // thread gathered since the last read_batch) to their mean in
+            // metric_data, then reset the aggregate for the next period.
+            auto &accum = m_devices.at(l0_device_idx).subdevice.metric_data_accum.at(l0_domain_idx);
+            auto &current = m_devices.at(l0_device_idx).subdevice.metric_data.at(l0_domain_idx);
+            size_t num_reports = 0;
+            for (const auto &kv : name_idx) {
+                const std::string &metric_name = kv.first;
+                auto &aggregate = accum[metric_name];
+                if (aggregate.count > 0) {
+                    current[metric_name] = std::vector<double>{ aggregate.sum / aggregate.count };
+                }
+                else {
+                    current[metric_name].clear();
+                }
+                num_reports = aggregate.count;
+                aggregate.sum = 0.0;
+                aggregate.count = 0;
+            }
+            current["NUM_REPORTS"] = std::vector<double>{ static_cast<double>(num_reports) };
+        }
+
+        // Launch the background sampling thread on first use.
+        metric_thread_start();
+    }
+
+    void LevelZeroImp::metric_thread_start(void)
+    {
+        // Called only from the single thread that services read_batch() (the
+        // controller directly, or the geopmd batch server when LevelZero is
+        // accessed through the service), never the background sampling thread,
+        // so the started flag need not be atomic.
+        if (!m_metric_thread_started) {
+            m_metric_thread_started = true;
+            m_metric_thread_active.store(true);
+            m_metric_thread = std::thread(&LevelZeroImp::metric_sample_thread, this);
+        }
+    }
+
+    void LevelZeroImp::metric_thread_stop(void)
+    {
+        if (m_metric_thread_active.exchange(false)) {
+            if (m_metric_thread.joinable()) {
+                m_metric_thread.join();
+            }
+        }
+    }
+
+    void LevelZeroImp::metric_sample_thread(void)
+    {
+        // Keep-alive draining: the read_batch() serving thread (the controller,
+        // or the geopmd batch server when LevelZero is accessed through the
+        // service) drains each chip itself in metric_read(), so this thread only
+        // needs to drain a chip when that serving thread hasn't drained it
+        // recently.  This keeps the metric streamer from stalling when
+        // read_batch() is called infrequently, while avoiding redundant draining
+        // (and lock contention) when it is called frequently.
+        while (m_metric_thread_active.load()) {
+            auto now = std::chrono::steady_clock::now();
+            for (unsigned int l0_device_idx = 0; l0_device_idx < m_num_gpu; ++l0_device_idx) {
+                unsigned int num_subdevice = m_devices.at(l0_device_idx).num_subdevice;
+                for (unsigned int l0_domain_idx = 0; l0_domain_idx < num_subdevice; ++l0_domain_idx) {
+                    std::lock_guard<std::mutex> lock(m_metric_mutex);
+                    auto &sub = m_devices.at(l0_device_idx).subdevice;
+                    if (!sub.metric_active.at(l0_domain_idx) ||
+                        !sub.metric_domain_cached.at(l0_domain_idx) ||
+                        !sub.metrics_initialized.at(l0_domain_idx)) {
+                        continue;
+                    }
+                    auto elapsed = now - sub.metric_last_drain.at(l0_domain_idx);
+                    if (elapsed >= std::chrono::microseconds(METRIC_DRAIN_PERIOD_US)) {
+                        // An exception escaping this thread would std::terminate
+                        // the process.  Stop draining the affected chip and hand
+                        // the error to the read_batch() path (metric_read).
+                        try {
+                            metric_drain(l0_device_idx, l0_domain_idx);
+                        }
+                        catch (...) {
+                            sub.metric_active.at(l0_domain_idx) = false;
+                            if (!m_metric_thread_error) {
+                                m_metric_thread_error = std::current_exception();
+                            }
+                        }
+                    }
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(METRIC_DRAIN_PERIOD_US));
+        }
+    }
+
+    void LevelZeroImp::metric_drain(unsigned int l0_device_idx, unsigned int l0_domain_idx)
+    {
+        // Caller must hold m_metric_mutex.
+        ze_result_t ze_result;
+        zet_metric_streamer_handle_t metric_streamer =
+            m_devices.at(l0_device_idx).subdevice.metric_streamer.at(l0_domain_idx);
+
+        // Record the drain attempt so the keep-alive thread can tell whether the
+        // read_batch() serving thread is draining this chip on its own.
+        m_devices.at(l0_device_idx).subdevice.metric_last_drain.at(l0_domain_idx) =
+            std::chrono::steady_clock::now();
+
+        // Request all queued reports; the buffer size caps the bytes read and
+        // the last-N processing below bounds the calculation work.
+        size_t read_size = m_devices.at(l0_device_idx).subdevice.zet_data.at(l0_domain_idx).size();
+        ze_result = zetMetricStreamerReadData(metric_streamer, UINT32_MAX,
+                                              &read_size,
+                                              m_devices.at(l0_device_idx).subdevice.zet_data.at(l0_domain_idx).data());
+
+        // Dropped-data is a warning with still-valid reports (FIFO overran); not a fault.
+        if (ze_result == ZE_RESULT_WARNING_DROPPED_DATA) {
+#ifdef GEOPM_DEBUG
+            std::cerr << "Warning: <geopm> LevelZero::" << std::string(__func__)
+                      << ": metric streamer dropped data; processing remaining reports."
+                      << std::endl;
+#endif
+            ze_result = ZE_RESULT_SUCCESS;
+        }
+
+        // NOT_READY just means no reports are queued yet; validate every other
+        // result (e.g. device loss) even when read_size == 0 so errors reach the
+        // background-thread error path instead of silently disabling telemetry.
+        if (ze_result != ZE_RESULT_NOT_READY) {
+            check_ze_result(ze_result, GEOPM_ERROR_RUNTIME,
+                            "LevelZero::" + std::string(__func__) +
+                            ": LevelZero Read Data failed",
+                            __LINE__);
+        }
+
+        // Skip when no data is available
+        if (ze_result != ZE_RESULT_NOT_READY && read_size > 0) {
+            // Learn per-report byte size from first successful read
+            size_t &report_byte_size = m_devices.at(l0_device_idx).subdevice.report_byte_size.at(l0_domain_idx);
+            if (report_byte_size == 0) {
+                uint32_t tmp_num_values = 0;
+                zet_metric_group_calculation_type_t tmp_calc_type = ZET_METRIC_GROUP_CALCULATION_TYPE_METRIC_VALUES;
+                zetMetricGroupCalculateMetricValues(
+                    m_devices.at(l0_device_idx).subdevice.metric_group_handle.at(l0_domain_idx),
+                    tmp_calc_type, read_size,
+                    m_devices.at(l0_device_idx).subdevice.zet_data.at(l0_domain_idx).data(),
+                    &tmp_num_values, nullptr);
+                uint32_t num_metric = m_devices.at(l0_device_idx).subdevice.num_metric.at(l0_domain_idx);
+                size_t first_num_reports = (num_metric > 0) ? tmp_num_values / num_metric : 1;
+                if (first_num_reports > 0) {
+                    report_byte_size = read_size / first_num_reports;
+                }
+            }
+
+            // Only process the most recent DEFAULT_MAX_REPORTS_PER_READ reports
+            size_t process_size = read_size;
+            const uint8_t *process_data = m_devices.at(l0_device_idx).subdevice.zet_data.at(l0_domain_idx).data();
+            if (report_byte_size > 0 && read_size > report_byte_size * DEFAULT_MAX_REPORTS_PER_READ) {
+                process_size = report_byte_size * DEFAULT_MAX_REPORTS_PER_READ;
+                process_data = m_devices.at(l0_device_idx).subdevice.zet_data.at(l0_domain_idx).data()
+                               + (read_size - process_size);
+            }
+
+            metric_calc(l0_device_idx, l0_domain_idx, process_size, process_data);
+        }
+    }
+
+    std::vector<double> LevelZeroImp::metric_sample(unsigned int l0_device_idx,
+                                                    unsigned int l0_domain_idx,
+                                                    std::string metric_name) const
+    {
+        std::vector<double> result = {};
+        // See metric_read: a subdeviceless GPU has no cached metric state, so
+        // report the domain as unsupported (a geopm::Exception the IOGroup prunes)
+        // instead of indexing an empty vector.
+        if (l0_domain_idx >= m_devices.at(l0_device_idx).subdevice.metric_domain_cached.size() ||
+            !m_devices.at(l0_device_idx).subdevice.metric_domain_cached.at(l0_domain_idx)) {
+            throw Exception("LevelZero::" + std::string(__func__) +
+                            ": Metric groups not cached" ,
+                            GEOPM_ERROR_INVALID, __FILE__, __LINE__);
+        }
+
+        if (m_devices.at(l0_device_idx).subdevice.metric_data.at(l0_domain_idx).count(metric_name) == 0) {
+            throw Exception("LevelZero::" + std::string(__func__) +
+                            ": No metric named " + metric_name  + " found." ,
+                            GEOPM_ERROR_INVALID, __FILE__, __LINE__);
+        }
+        result = m_devices.at(l0_device_idx).subdevice.metric_data.at(l0_domain_idx).at(metric_name);
+        return result;
+    }
+
     void LevelZeroImp::ras_domain_cache(unsigned int device_idx)
     {
         uint32_t ras_handle_count = 0;
-        uint32_t num_subdevice = m_devices.at(device_idx).m_num_subdevice;
+        uint32_t num_subdevice = m_devices.at(device_idx).num_subdevice;
         // Find number of RAS error sets for the GPU
         uint32_t num_errset = 0;
         ze_result_t ze_result = zesDeviceEnumRasErrorSets(m_devices.at(device_idx).device_handle,
@@ -536,8 +1156,8 @@ namespace geopm
                             GEOPM_ERROR_RUNTIME, "LevelZero::" + std::string(__func__) +
                             ": Sysman failed to get errorset handle(s).", __LINE__);
 
-	    // Note: RAS domain errorset handles are being stored in a 2D vector with
-	    //       dimensions := (number of subdevices) x (number of RAS error types)
+	        // Note: RAS domain errorset handles are being stored in a 2D vector with
+	        //       dimensions := (number of subdevices) x (number of RAS error types)
 
             // Allocate size for a 2D vector to store all the RAS domain handles for errorsets:
             //       m_num_subdevice = number of subdevices on specific GPU device
@@ -951,11 +1571,11 @@ namespace geopm
     {
         uint64_t timestamp = 0;
         //PACKAGE
-        if(geopm_domain == GEOPM_DOMAIN_GPU) {
+        if (geopm_domain == GEOPM_DOMAIN_GPU) {
             timestamp = m_devices.at(l0_device_idx).cached_energy_timestamp;
         }
         //TILE
-        else if(geopm_domain == GEOPM_DOMAIN_GPU_CHIP) {
+        else if (geopm_domain == GEOPM_DOMAIN_GPU_CHIP) {
             timestamp = m_devices.at(l0_device_idx).subdevice.cached_energy_timestamp.at(l0_domain_idx);
         }
         return timestamp;
@@ -1078,6 +1698,16 @@ namespace geopm
                         ": Sysman failed to set performance factor values", __LINE__);
     }
 
+    uint32_t LevelZeroImp::metric_update_rate(unsigned int l0_device_idx) const
+    {
+        return m_devices.at(l0_device_idx).metric_sampling_period_ns;
+    }
+
+    void LevelZeroImp::metric_update_rate_control(unsigned int l0_device_idx, uint32_t setting)
+    {
+        m_devices.at(l0_device_idx).metric_sampling_period_ns = setting;
+    }
+
     void LevelZeroImp::check_ze_result(ze_result_t ze_result, int error,
                                        std::string message, int line) const
     {
@@ -1105,7 +1735,13 @@ namespace geopm
               {ZE_RESULT_ERROR_INVALID_NULL_POINTER,
                "ZE_RESULT_ERROR_INVALID_NULL_POINTER"},
               {ZE_RESULT_ERROR_UNKNOWN,
-               "ZE_RESULT_ERROR_UNKNOWN"}
+               "ZE_RESULT_ERROR_UNKNOWN"},
+              {ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY,
+               "ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY"},
+              {ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY,
+               "ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY"},
+              {ZE_RESULT_WARNING_DROPPED_DATA,
+               "ZE_RESULT_WARNING_DROPPED_DATA"}
         };
 
         std::string error_string = std::to_string(ze_result);
