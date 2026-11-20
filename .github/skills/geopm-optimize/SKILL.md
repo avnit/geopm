@@ -42,7 +42,7 @@ If the user is new to GEOPM, read
 v1 tunes and measures **only the node running `geopmopt`**. If the workload is
 distributed, say so before proposing anything, and offer to tune a single
 representative node instead. Multi-node support is deferred pending a
-`geopmsession --hostfile` transport; see `plan-for-agents.md`.
+`geopmsession --hostfile` transport.
 
 Also flag the shared-machine problem: a campaign changes package-wide or
 board-wide settings, so it affects every other workload on the node and is
@@ -252,6 +252,9 @@ that the workload runs, the regex matches, and the controls are writable.
 ```
 total ≈ trials × single-run time × 1.5
 ```
+
+When the grid has no more points than `--trials`, use the number of grid points
+instead of `trials`: geopmopt evaluates each point once and stops.
 
 **Present the estimate and get explicit agreement before starting.** A 40-trial
 campaign on a 90-second workload is about 90 minutes.
